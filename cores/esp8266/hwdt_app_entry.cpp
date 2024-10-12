@@ -277,6 +277,7 @@
 #include <esp8266_peri.h>
 #include <uart.h>
 #include <pgmspace.h>
+#include "flash_utils.h"
 #include "umm_malloc/umm_malloc.h"
 #include "mmu_iram.h"
 
@@ -292,7 +293,6 @@ uint32_t __zero_return() {
 extern uint32_t stack_thunk_get_refcnt() __attribute__((weak, alias("__zero_return")));
 extern uint32_t stack_thunk_get_stack_top() __attribute__((weak, alias("__zero_return")));
 extern uint32_t stack_thunk_get_stack_bot() __attribute__((weak, alias("__zero_return")));
-
 }
 
 // #define DEBUG_ESP_HWDT_DEV_DEBUG
@@ -745,6 +745,43 @@ STATIC uint32_t IRAM_MAYBE get_reset_reason(bool* power_on, bool* hwdt_reset) {
     return hwdt_info.reset_reason;
 }
 
+
+STATIC uint32_t get_sketch_size() {
+    size_t result = 0;
+
+    image_header_t image_header;
+    uint32_t pos = APP_START_OFFSET;
+    /*auto rv =*/ spi_flash_read(pos, (uint32_t*) &image_header, sizeof(image_header));
+    //ETS_PRINTF("rv = %d, num_segments=%u\r\n", rv, image_header.num_segments); 
+    pos += sizeof(image_header);
+
+    for (uint32_t section_index = 0;
+        section_index < image_header.num_segments;
+        ++section_index)
+    {
+        section_header_t section_header = {0, 0};
+        /*rv =*/ spi_flash_read(pos, (uint32_t*) &section_header, sizeof(section_header));
+        //ETS_PRINTF("si=%d, pos=%d, rv=%d, seg=%u\r\n", section_header, pos, rv, section_header.size); 
+        pos += sizeof(section_header);
+        pos += section_header.size;
+    }
+    result = (pos + 16) & ~15;
+    return result;
+}
+
+namespace {
+  struct crash_metadata {
+    uint32_t magic;
+    rst_info info;
+    uintptr_t stack, stack_end;
+  } __attribute__((aligned(4)));
+
+  constexpr uint32_t MAGIC_NUMBER = 0xDEAD9876U;
+  constexpr uint32_t RAM_BASE = 0x3FFE8000;
+  constexpr uint32_t RAM_SIZE = 0x18000;
+}
+
+
 #ifdef DEBUG_ESP_HWDT_UART_SPEED
 /*
  * Here we use uart_div_modify in the Boot ROM. Note the Boot ROM version does
@@ -944,6 +981,36 @@ STATIC void IRAM_MAYBE handle_hwdt(void) {
 
         if (hwdt_reset) {
             ETS_PRINTF("\n\nHardware WDT reset\n");
+
+            // Save RAM in to flash
+            const size_t sketch_size = get_sketch_size();
+            if (sketch_size > 0) {                     
+                const size_t flash_addr = (sketch_size + FLASH_SECTOR_SIZE - 1) & (~(FLASH_SECTOR_SIZE - 1));
+                ETS_PRINTF("Flash addr: %x\n",flash_addr);
+                crash_metadata c;
+                spi_flash_read(flash_addr,  (uint32_t*) &c, sizeof(c));
+                if (c.magic == 0xFFFFFFFFU) {
+                    for(auto block = 0U; block < 1+(RAM_SIZE/FLASH_SECTOR_SIZE); ++block) {
+                        auto tgt = (flash_addr/FLASH_SECTOR_SIZE) + block;
+                        //ETS_PRINTF("Erasing: %x\n",tgt);
+                        spi_flash_erase_sector(tgt);
+                    }
+
+                    ETS_PRINTF("Writing core dump\n");
+                    c.magic = MAGIC_NUMBER;
+                    c.stack = (uintptr_t) ctx_sys_ptr;
+                    c.stack_end = (uintptr_t) ROM_STACK;
+                    spi_flash_write(flash_addr, (uint32_t*) &c, sizeof(c));
+
+                    // all of RAM
+                    for(auto off = 0U; off < RAM_SIZE; off += FLASH_SECTOR_SIZE) {
+                        auto tgt = flash_addr + FLASH_SECTOR_SIZE + off;
+                        //ETS_PRINTF("Writing: %x %x\n",tgt);
+                        spi_flash_write(tgt, (uint32_t*) (RAM_BASE + off), FLASH_SECTOR_SIZE);
+                    }                
+                }
+            }
+
 #ifndef USE_IRAM
             if (bearssl_stack_top) {
                 /* Print context bearssl */
